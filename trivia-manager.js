@@ -1,110 +1,211 @@
 const fs = require('fs');
 const path = require('path');
 
-const QUESTIONS_MODULE = path.join(__dirname, 'trivia-questions.js');
 const STATE_DIR = path.join(__dirname, 'data');
 const STATE_FILE = path.join(STATE_DIR, 'trivia-state.json');
 
 if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true });
 
+/**
+ * Load trivia questions from trivia-questions.js
+ * Supports multiple export formats
+ */
 function loadQuestions() {
-  // support multiple export shapes (array or { questions: [] } )
   const mod = require('./trivia-questions');
   if (Array.isArray(mod)) return mod.slice();
   if (Array.isArray(mod.questions)) return mod.questions.slice();
   if (Array.isArray(mod.default)) return mod.default.slice();
-  // fallback: try common const name
   if (mod && Array.isArray(mod.TRIVIA_QUESTIONS)) return mod.TRIVIA_QUESTIONS.slice();
   return [];
 }
 
-function loadState() {
-  try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-  } catch {
-    return { usage: {}, recent: {} };
-  }
-}
-
-function saveState(state) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
-}
-
-function makeId(q, idx) {
+/**
+ * Generate a stable ID for each question
+ * Uses existing id field if available, otherwise derives from question text
+ */
+function makeQuestionId(q, idx) {
   if (q.id) return String(q.id);
-  const text = String(q.q || q.question || q.text || '').slice(0, 120);
+  const text = String(q.q || q.question || q.text || q.prompt || '').slice(0, 120);
   return `q_${idx}_${Buffer.from(text).toString('base64').slice(0, 8)}`;
 }
 
-class TriviaManager {
-  constructor(opts = {}) {
-    this.recentWindowSize = opts.recentWindowSize || 40; // last N to avoid per-thread
-    this.questions = loadQuestions().map((q, i) => ({ ...q, _id: makeId(q, i) }));
-    this.state = loadState();
-    if (!this.state.usage) this.state.usage = {};
-    if (!this.state.recent) this.state.recent = {};
+/**
+ * Normalize a raw question object to match games.js format
+ */
+function normalizeQuestion(raw) {
+  if (!raw) return null;
+  const question = raw.q || raw.question || raw.text || raw.prompt;
+  const options = raw.options || raw.choices || raw.answers;
+  const answer = raw.answer ?? raw.correct ?? raw.correctAnswer ?? raw.correctIndex;
+  const correctIndex = Number(answer);
+
+  if (
+    !question ||
+    !Array.isArray(options) ||
+    options.length < 4 ||
+    !Number.isInteger(correctIndex) ||
+    correctIndex < 0 ||
+    correctIndex > 3
+  ) {
+    return null;
   }
 
-  _scopeKey({ threadID = null, userID = null } = {}) {
-    // keep repetition avoidance per thread (chat). Use user if you prefer per-user.
+  return {
+    question: String(question),
+    options: options.slice(0, 4).map((opt) => String(opt)),
+    answer: correctIndex,
+  };
+}
+
+/**
+ * Load state from disk
+ * Format: { cycles: { 'thread:ID': { pool: [id, id, ...], used: Set of ids, currentIdx } } }
+ */
+function loadState() {
+  try {
+    const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    // Convert used arrays back to Sets
+    if (data.cycles) {
+      for (const key in data.cycles) {
+        if (data.cycles[key].used && Array.isArray(data.cycles[key].used)) {
+          data.cycles[key].used = new Set(data.cycles[key].used);
+        }
+      }
+    }
+    return data;
+  } catch {
+    return { cycles: {} };
+  }
+}
+
+/**
+ * Save state to disk
+ * Convert Sets to arrays for JSON serialization
+ */
+function saveState(state) {
+  const toSave = { cycles: {} };
+  for (const key in state.cycles) {
+    const cycle = state.cycles[key];
+    toSave.cycles[key] = {
+      pool: cycle.pool || [],
+      used: Array.from(cycle.used || []),
+      currentIdx: cycle.currentIdx || 0,
+    };
+  }
+  fs.writeFileSync(STATE_FILE, JSON.stringify(toSave, null, 2), 'utf8');
+}
+
+/**
+ * Shuffle an array using Fisher-Yates algorithm
+ */
+function shuffle(arr) {
+  const result = arr.slice();
+  for (let i = result.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
+}
+
+class TriviaManager {
+  constructor() {
+    // Load all questions once at startup
+    const raw = loadQuestions();
+    this.allQuestions = raw
+      .map((q, idx) => {
+        const normalized = normalizeQuestion(q);
+        if (normalized) {
+          return { ...normalized, _id: makeQuestionId(q, idx) };
+        }
+        return null;
+      })
+      .filter(Boolean);
+
+    this.state = loadState();
+    console.log(`[trivia-manager] Loaded ${this.allQuestions.length} questions`);
+  }
+
+  _scopeKey(threadID) {
     return `thread:${String(threadID || 'global')}`;
   }
 
-  async getNextQuestion({ threadID = null, userID = null, tags = [] } = {}) {
-    if (!this.questions || this.questions.length === 0) return null;
-    const key = this._scopeKey({ threadID, userID });
-    const recent = new Set(this.state.recent[key] || []);
-
-    // filter by tags if provided
-    let pool = this.questions.filter((q) => {
-      if (tags && tags.length) {
-        if (!q.tags) return false;
-        const has = tags.some((t) => (q.tags || []).includes(t));
-        if (!has) return false;
-      }
-      return true;
-    });
-
-    // prefer those not in recent
-    let candidates = pool.filter((q) => !recent.has(q._id));
-    if (candidates.length === 0) candidates = pool.slice();
-
-    // compute usage counts
-    candidates.forEach((c) => { c._uses = Number(this.state.usage[c._id] || 0); });
-
-    // weighted random: weight = 1 / (1 + uses)
-    const total = candidates.reduce((s, c) => s + 1 / (1 + c._uses), 0);
-    let pick = Math.random() * total;
-    let chosen = candidates[candidates.length - 1];
-    for (const c of candidates) {
-      pick -= 1 / (1 + c._uses);
-      if (pick <= 0) { chosen = c; break; }
+  /**
+   * Get the next trivia question for a thread
+   * TRUE NO-REPEAT: Each question used once per full cycle, then restart
+   */
+  async getNextQuestion({ threadID = null } = {}) {
+    if (!this.allQuestions || this.allQuestions.length === 0) {
+      console.error('[trivia-manager] No questions loaded');
+      return null;
     }
 
-    // record usage & recent
-    this.state.usage[chosen._id] = (this.state.usage[chosen._id] || 0) + 1;
-    this.state.recent[key] = [chosen._id].concat(this.state.recent[key] || []).slice(0, this.recentWindowSize);
-    saveState(this.state);
+    const key = this._scopeKey(threadID);
 
-    // normalize shape to games.js expectations
-    const questionText = chosen.q || chosen.question || chosen.prompt || chosen.text || '';
-    const options = chosen.options || chosen.choices || chosen.answers || null;
-    const answer = (chosen.answer ?? chosen.correct ?? chosen.correctIndex ?? chosen.correctAnswer);
+    // Initialize cycle for this thread if not exists
+    if (!this.state.cycles[key]) {
+      const shuffled = shuffle(this.allQuestions.map((q) => q._id));
+      this.state.cycles[key] = {
+        pool: shuffled,
+        used: new Set(),
+        currentIdx: 0,
+      };
+      saveState(this.state);
+    }
 
-    // If options is an object or not array, try to coerce
-    const normalizedOptions = Array.isArray(options) ? options.slice(0, 4).map(String) : null;
+    const cycle = this.state.cycles[key];
 
-    return {
-      question: String(questionText),
-      options: normalizedOptions,
-      answer: Number.isFinite(Number(answer)) ? Number(answer) : null,
-      _raw: chosen,
-    };
+    // Check if cycle exhausted
+    if (cycle.used.size >= this.allQuestions.length) {
+      console.log(`[trivia-manager] Cycle exhausted for ${key}, resetting`);
+      const shuffled = shuffle(this.allQuestions.map((q) => q._id));
+      cycle.pool = shuffled;
+      cycle.used = new Set();
+      cycle.currentIdx = 0;
+      saveState(this.state);
+    }
+
+    // Find next unused question in pool
+    let attempts = 0;
+    while (cycle.currentIdx < cycle.pool.length && attempts < cycle.pool.length) {
+      const qid = cycle.pool[cycle.currentIdx];
+      cycle.currentIdx++;
+
+      if (!cycle.used.has(qid)) {
+        cycle.used.add(qid);
+        saveState(this.state);
+
+        // Find and return the question object
+        const q = this.allQuestions.find((x) => x._id === qid);
+        if (q) return q;
+      }
+      attempts++;
+    }
+
+    // Should not reach here if pool is correctly shuffled
+    console.error(`[trivia-manager] Failed to find unused question for ${key}`);
+    return null;
   }
 
-  // admin helpers
-  async resetUsage() { this.state.usage = {}; saveState(this.state); }
-  async resetRecent() { this.state.recent = {}; saveState(this.state); }
+  /**
+   * Admin: Reset usage for a thread (e.g., if database changes)
+   */
+  async resetThread(threadID) {
+    const key = this._scopeKey(threadID);
+    if (this.state.cycles[key]) {
+      delete this.state.cycles[key];
+      saveState(this.state);
+      console.log(`[trivia-manager] Reset cycle for ${key}`);
+    }
+  }
+
+  /**
+   * Admin: Reset all threads
+   */
+  async resetAll() {
+    this.state.cycles = {};
+    saveState(this.state);
+    console.log('[trivia-manager] Reset all cycles');
+  }
 }
 
 module.exports = new TriviaManager();
